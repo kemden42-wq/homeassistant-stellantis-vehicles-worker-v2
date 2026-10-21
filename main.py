@@ -1,4 +1,3 @@
-"""
 Stellantis OAuth worker (aangepaste versie voor MyPeugeot / Gigya-login)
 
 Gebaseerd op andreadegiovine/homeassistant-stellantis-vehicles-worker-v2.
