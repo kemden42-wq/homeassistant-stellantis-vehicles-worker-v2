@@ -144,10 +144,10 @@ PICK_JS = r"""
     root.querySelectorAll('*').forEach((e) => { if (e.shadowRoot) walk(e.shadowRoot); });
   };
   walk(document);
-  all.forEach((e) => e.removeAttribute && e.removeAttribute('data-sv-pick'));
+  all.forEach((e) => e.removeAttribute && e.removeAttribute('data-sv-' + kind));
   const pw = all.filter((e) => e.tagName === 'INPUT' && (e.type || '').toLowerCase() === 'password' && vis(e));
   if (kind === 'password') {
-    if (pw[0]) { pw[0].setAttribute('data-sv-pick', 'password'); return true; }
+    if (pw[0]) { pw[0].setAttribute('data-sv-password', '1'); return true; }
     return false;
   }
   if (kind === 'email') {
@@ -160,10 +160,17 @@ PICK_JS = r"""
       return vis(e);
     });
     let pick = null;
-    if (pw.length) pick = cand.find((e) => e.form && e.form === pw[0].form);
+    if (pw.length) {
+      // zelfde <form> als het zichtbare wachtwoordveld, anders dichtstbijzijnde gemeenschappelijke container
+      pick = cand.find((e) => e.form && e.form === pw[0].form);
+      if (!pick) {
+        let box = pw[0].parentElement;
+        while (box && !pick) { pick = cand.find((e) => box.contains(e)); box = box.parentElement; }
+      }
+    }
     pick = pick || cand.find((e) => /mail|user|login|ident/i.test((e.name || '') + ' ' + (e.id || '') + ' ' + (e.autocomplete || '')));
     pick = pick || cand[0];
-    if (pick) { pick.setAttribute('data-sv-pick', 'email'); return true; }
+    if (pick) { pick.setAttribute('data-sv-email', '1'); return true; }
     return false;
   }
   return false;
@@ -367,7 +374,7 @@ async def pick_with_js(page, kind):
     for frame in page.frames:
         try:
             if await frame.evaluate(PICK_JS, kind):
-                el = frame.locator(f'[data-sv-pick="{kind}"]').first
+                el = frame.locator(f'[data-sv-{kind}="1"]').first
                 if await el.count() and await el.is_visible():
                     return el, f"js-fallback:{kind}", frame
         except Exception:
@@ -375,15 +382,23 @@ async def pick_with_js(page, kind):
     return None, None, None
 
 
-async def wait_visible(page, selectors, timeout_ms, process_id, label, js_kind=None):
+async def wait_visible(page, selectors, timeout_ms, process_id, label, js_kind=None, js_first=False):
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
-        el, sel, frame = await first_visible(page, selectors)
-        if not el and js_kind:
+        el = sel = frame = None
+        if js_kind and js_first:
+            el, sel, frame = await pick_with_js(page, js_kind)
+        if not el:
+            el, sel, frame = await first_visible(page, selectors)
+        if not el and js_kind and not js_first:
             el, sel, frame = await pick_with_js(page, js_kind)
         if el:
             where = "main" if frame == page.main_frame else f"iframe {redact(frame.url)[:80]}"
-            log_process(f"{label} found via {sel} ({where})", process_id, True)
+            try:
+                info = await el.evaluate("e => ({name: e.name || '', id: e.id || '', type: e.type || '', form: (e.form && e.form.id) || ''})")
+            except Exception:
+                info = {}
+            log_process(f"{label} found via {sel} ({where}) {info}", process_id, True)
             return el
         if time.monotonic() > deadline:
             return None
@@ -413,8 +428,12 @@ async def visible_text(page, selectors):
 
 
 async def safe_fill(el, value):
-    await el.click(timeout=5000)
-    await el.fill("")
+    try:
+        await el.click(timeout=3000)
+    except Exception:
+        # veld wordt afgedekt (cookie-banner/overlay): focus via JS, geen klik nodig
+        await el.evaluate("e => { e.scrollIntoView({block: 'center'}); e.focus(); }")
+    await el.fill("", timeout=10000)
     try:
         await el.press_sequentially(value, delay=40)
     except AttributeError:
@@ -542,16 +561,25 @@ async def fetch(request: Request):
             await dismiss_cookies(page, process_id)
 
             # ---------------- login ----------------
+            # Eerst het zichtbare wachtwoordveld; het e-mailveld moet in HETZELFDE formulier zitten
+            # (Peugeot heeft meerdere formulieren met input[name="username"] op de pagina).
             log_process("Waiting for login form...", process_id, True)
-            email_el = await wait_visible(page, EMAIL_SELECTORS, timeout_input, process_id, "Email field", "email")
+            pw_el = await wait_visible(page, PASSWORD_SELECTORS, timeout_input, process_id, "Password field", "password")
+
+            if pw_el:
+                email_el = await wait_visible(page, EMAIL_SELECTORS, 10000, process_id, "Email field", "email", js_first=True)
+            else:
+                email_el = await wait_visible(page, EMAIL_SELECTORS, 10000, process_id, "Email field", "email")
             if not email_el:
                 await dump_debug(page, process_id, "email field not found", email)
                 raise Exception("Geen zichtbaar e-mailveld gevonden (zie DEBUG-regels in de log)")
 
-            pw_el = await wait_visible(page, PASSWORD_SELECTORS, 10000, process_id, "Password field", "password")
-
             log_process("Filling credentials...", process_id, True)
-            await safe_fill(email_el, email)
+            try:
+                await safe_fill(email_el, email)
+            except Exception as e:
+                await dump_debug(page, process_id, f"fill email failed: {e}", email)
+                raise Exception(f"E-mail invullen mislukt: {e}")
 
             if not pw_el:
                 # Mogelijk tweestaps-login: eerst e-mail, dan "Volgende"
@@ -566,11 +594,26 @@ async def fetch(request: Request):
                     await dump_debug(page, process_id, "password field not found", email)
                     raise Exception("Geen zichtbaar wachtwoordveld gevonden")
 
-            await safe_fill(pw_el, password)
+            try:
+                await safe_fill(pw_el, password)
+            except Exception as e:
+                await dump_debug(page, process_id, f"fill password failed: {e}", email)
+                raise Exception(f"Wachtwoord invullen mislukt: {e}")
             await dismiss_cookies(page, process_id)
 
             log_process("Submitting login form...", process_id, True)
-            submit_el, sel, _ = await first_visible(page, SUBMIT_SELECTORS)
+            submit_el = None
+            sel = None
+            try:
+                same_form = pw_el.locator("xpath=ancestor::form[1]").locator('[type="submit"], button:not([type="button"])')
+                for i in range(min(await same_form.count(), 10)):
+                    if await same_form.nth(i).is_visible():
+                        submit_el, sel = same_form.nth(i), "same form as password"
+                        break
+            except Exception:
+                pass
+            if not submit_el:
+                submit_el, sel, _ = await first_visible(page, SUBMIT_SELECTORS)
             submitted = False
             if submit_el:
                 try:
