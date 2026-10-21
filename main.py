@@ -340,6 +340,7 @@ async def startup():
     os.makedirs(DEBUG_DIR, exist_ok=True)
     async with browser_lock:
         await start_browser()
+    schedule_prewarm(DEFAULT_OAUTH_URL)
 
 
 @app.on_event("shutdown")
@@ -570,23 +571,142 @@ async def dump_debug(page, process_id, reason, email=None):
 # Main endpoint
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Loginpagina openen + vooraf klaarzetten (scheelt ~25 s per login op Render Free)
+# --------------------------------------------------------------------------- #
+
+last_url = {}
+WARM_MAX_AGE = int(os.environ.get("WARM_MAX_AGE", "720"))   # seconden
+warm_pages = {}      # url -> {"context", "page", "state", "ts"}
+warm_task = None
+
+
+def _on_url(state, url, source):
+    if state.get("code"):
+        return
+    code = extract_final_code(url)
+    pid = state.get("pid", "-")
+    if code:
+        state["code"] = code
+        log_process(f"Code captured ({source})", pid, True)
+    elif "code=" in (url or "") and "oauth2redirect" not in (url or ""):
+        log_process(f"Ignored intermediate code URL ({source}): {redact(url)[:120]}", pid)
+
+
+async def _open_login_page(url, state, timeout_page, process_id):
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 900},
+        locale="nl-NL",
+        timezone_id="Europe/Amsterdam",
+        java_script_enabled=True,
+        bypass_csp=True,
+        ignore_https_errors=True,
+    )
+    await context.add_init_script(STEALTH_JS)
+    context.on("request", lambda r: _on_url(state, r.url, "request"))
+    context.on("requestfailed", lambda r: _on_url(state, r.url, "requestfailed"))
+
+    def on_response(resp):
+        try:
+            if 300 <= resp.status < 400:
+                loc = resp.headers.get("location", "")
+                if loc:
+                    _on_url(state, loc, "redirect-header")
+        except Exception:
+            pass
+
+    context.on("response", on_response)
+    page = await context.new_page()
+
+    # Zware/overbodige bestanden blokkeren via Chrome zelf (geen onderschepping,
+    # zodat de mymap://-redirect zichtbaar blijft).
+    try:
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("Network.enable")
+        await cdp.send("Network.setBlockedURLs", {"urls": [
+            "*.png*", "*.jpg*", "*.jpeg*", "*.gif*", "*.webp*", "*.svg*", "*.ico*",
+            "*.woff*", "*.ttf*", "*.otf*", "*.mp4*", "*.webm*",
+            "*google-analytics*", "*googletagmanager*", "*doubleclick*", "*facebook*",
+            "*hotjar*", "*clarity.ms*", "*contentsquare*", "*adobedtm*", "*demdex*",
+            "*omtrdc*", "*criteo*", "*tiktok*", "*linkedin*", "*bat.bing*",
+        ]})
+    except Exception as e:
+        log_process(f"Resource blocking unavailable: {e}", process_id)
+
+    page.on("framenavigated", lambda f: _on_url(state, f.url, "navigated"))
+
+    log_process(f"Navigating to login: {redact(url)}", process_id, True)
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_page)
+    return context, page
+
+
+async def _close_quietly(context):
+    try:
+        await context.close()
+    except Exception:
+        pass
+
+
+async def _do_prewarm(url):
+    pid = "prewarm"
+    async with browser_lock:
+        try:
+            await ensure_browser()
+            old = warm_pages.pop(url, None)
+            if old:
+                await _close_quietly(old["context"])
+            state = {"code": None, "pid": pid}
+            t0 = time.perf_counter()
+            context, page = await _open_login_page(url, state, 60000, pid)
+            try:
+                await page.locator('input[type="password"] >> visible=true').first.wait_for(state="visible", timeout=60000)
+            except Exception:
+                await _close_quietly(context)
+                log_process("Pre-load failed: login form not visible", pid, True)
+                return
+            await dismiss_cookies(page, pid)
+            warm_pages[url] = {"context": context, "page": page, "state": state, "ts": time.monotonic()}
+            log_process(f"Login page pre-loaded in {time.perf_counter() - t0:.1f}s", pid, True)
+        except Exception as e:
+            log_process(f"Pre-load failed: {e}", pid, True)
+
+
+def schedule_prewarm(url):
+    global warm_task
+    if not url:
+        return
+    if warm_task and not warm_task.done():
+        return
+    w = warm_pages.get(url)
+    if w and time.monotonic() - w["ts"] < WARM_MAX_AGE - 120 and not w["page"].is_closed():
+        return
+    warm_task = asyncio.create_task(_do_prewarm(url))
+
+
+async def _take_warm(url, process_id):
+    if warm_task and not warm_task.done():
+        log_process("Waiting for pre-load that is already running", process_id, True)
+        try:
+            await asyncio.wait_for(asyncio.shield(warm_task), timeout=70)
+        except Exception:
+            pass
+    w = warm_pages.pop(url, None)
+    if not w:
+        return None
+    if time.monotonic() - w["ts"] > WARM_MAX_AGE or w["page"].is_closed():
+        await _close_quietly(w["context"])
+        return None
+    return w
+
+
 async def _login(payload, process_id):
     """Volledige browser-login. Geeft (status, code_of_melding) terug."""
     global force_debug
     context = None
     page = None
-    state = {"code": None}
+    state = {"code": None, "pid": process_id}
     email = None
-
-    def on_url(url, source):
-        if state["code"]:
-            return
-        code = extract_final_code(url)
-        if code:
-            state["code"] = code
-            log_process(f"Code captured ({source})", process_id, True)
-        elif "code=" in (url or "") and "oauth2redirect" not in (url or ""):
-            log_process(f"Ignored intermediate code URL ({source}): {redact(url)[:120]}", process_id)
 
     try:
         url = payload.get("url")
@@ -599,55 +719,17 @@ async def _login(payload, process_id):
         if not url or not email or not password:
             return (400, "Missing required params")
 
+        warm = await _take_warm(url, process_id)
+
         async with browser_lock:
             await ensure_browser()
 
-            context = await browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 900},
-                locale="nl-NL",
-                timezone_id="Europe/Amsterdam",
-                java_script_enabled=True,
-                bypass_csp=True,
-                ignore_https_errors=True,
-            )
-            await context.add_init_script(STEALTH_JS)
-
-            context.on("request", lambda r: on_url(r.url, "request"))
-            context.on("requestfailed", lambda r: on_url(r.url, "requestfailed"))
-
-            def on_response(resp):
-                try:
-                    if 300 <= resp.status < 400:
-                        loc = resp.headers.get("location", "")
-                        if loc:
-                            on_url(loc, "redirect-header")
-                except Exception:
-                    pass
-
-            context.on("response", on_response)
-
-            page = await context.new_page()
-
-            # Zware/overbodige bestanden blokkeren via Chrome zelf (geen onderschepping,
-            # zodat de mymap://-redirect zichtbaar blijft). Scheelt veel tijd op Render Free.
-            try:
-                cdp = await context.new_cdp_session(page)
-                await cdp.send("Network.enable")
-                await cdp.send("Network.setBlockedURLs", {"urls": [
-                    "*.png*", "*.jpg*", "*.jpeg*", "*.gif*", "*.webp*", "*.svg*", "*.ico*",
-                    "*.woff*", "*.ttf*", "*.otf*", "*.mp4*", "*.webm*",
-                    "*google-analytics*", "*googletagmanager*", "*doubleclick*", "*facebook*",
-                    "*hotjar*", "*clarity.ms*", "*contentsquare*", "*adobedtm*", "*demdex*",
-                    "*omtrdc*", "*criteo*", "*tiktok*", "*linkedin*", "*bat.bing*",
-                ]})
-            except Exception as e:
-                log_process(f"Resource blocking unavailable: {e}", process_id)
-
-            page.on("framenavigated", lambda f: on_url(f.url, "navigated"))
-
-            log_process(f"Navigating to login: {redact(url)}", process_id, True)
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_page)
+            if warm:
+                context, page, state = warm["context"], warm["page"], warm["state"]
+                state["pid"] = process_id
+                log_process(f"Using pre-loaded login page (klaargezet {time.monotonic() - warm['ts']:.0f}s geleden)", process_id, True)
+            else:
+                context, page = await _open_login_page(url, state, timeout_page, process_id)
 
             await dismiss_cookies(page, process_id)
 
@@ -856,6 +938,8 @@ async def _run_job(key, payload, process_id):
         status, message = await _login(payload, process_id)
     except Exception as e:
         status, message = 400, str(e)
+    last_url["url"] = payload.get("url")
+    schedule_prewarm(payload.get("url"))
     if status == 200:
         # Code klaarzetten; precies ÉÉN aanvraag mag hem ophalen (een code is eenmalig).
         code_cache[key] = (message, time.monotonic())
@@ -942,6 +1026,7 @@ async def healthcheck():
             except Exception:
                 pass
             await start_browser()
+    schedule_prewarm(last_url.get("url") or DEFAULT_OAUTH_URL)
     return {"status": "ok"}
 
 
@@ -990,5 +1075,66 @@ async def debug_html(request: Request):
             return PlainTextResponse(f.read())
     except Exception:
         return PlainTextResponse("Geen HTML", status_code=404)
+
+# --------------------------------------------------------------------------- #
+# Handmatige route: loginpagina in je eigen browser (geen 60s-limiet van HA)
+#   1. Zet env-var DEBUG_TOKEN in Render (bijv. een lang geheim woord).
+#   2. Open https://<worker>/login?token=<DEBUG_TOKEN>
+#   3. Vul e-mail + wachtwoord in, wacht ~1 minuut, kopieer de code.
+#   4. Kies in HA "Gebruik de manuele methode" en plak de code (binnen ~1 minuut).
+# --------------------------------------------------------------------------- #
+
+DEFAULT_OAUTH_URL = os.environ.get(
+    "DEFAULT_OAUTH_URL",
+    "https://idpcvs.peugeot.com/am/oauth2/authorize?client_id=1eebc2d5-5df3-459b-a624-20abfcf82530"
+    "&response_type=code&redirect_uri=mymap://oauth2redirect/nl&scope=openid%20profile%20email&locale=nl-NL",
+)
+
+LOGIN_PAGE = """<!doctype html><html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Peugeot code</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:520px}
+h1{font-size:20px}label{display:block;margin:14px 0 4px;font-size:14px;color:#bbb}
+input{width:100%;box-sizing:border-box;padding:12px;font-size:16px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
+button{margin-top:18px;width:100%;padding:14px;font-size:16px;border:0;border-radius:8px;background:#03a9f4;color:#fff}
+button:disabled{opacity:.5}#out{margin-top:20px;padding:14px;border-radius:8px;background:#1d1d1d;white-space:pre-wrap;word-break:break-all}
+.code{font-family:monospace;font-size:15px;color:#8f8}small{color:#999}
+</style></head><body>
+<h1>MyPeugeot-code ophalen</h1>
+<small>De login draait op deze worker; er wordt niets opgeslagen.</small>
+<label>E-mail</label><input id="email" type="email" autocomplete="username">
+<label>Wachtwoord</label><input id="password" type="password" autocomplete="current-password">
+<details><summary><small>OAuth-URL (alleen wijzigen voor ander land/merk)</small></summary>
+<input id="url" value="__URL__"></details>
+<button id="go">Code ophalen</button>
+<div id="out">Klaar om te starten.</div>
+<script>
+const out=document.getElementById('out'),go=document.getElementById('go');
+go.onclick=async()=>{
+  go.disabled=true;let t=0;out.textContent='Bezig met inloggen bij Peugeot... 0 s';
+  const timer=setInterval(()=>{t++;out.textContent='Bezig met inloggen bij Peugeot... '+t+' s (duurt ca. 1 minuut)';},1000);
+  try{
+    const r=await fetch('/',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url:document.getElementById('url').value,email:document.getElementById('email').value,
+      password:document.getElementById('password').value})});
+    const j=await r.json();clearInterval(timer);
+    if(r.ok&&j.code&&typeof j.code==='string'){
+      out.innerHTML='<b>Code (plak binnen 1 minuut in HA, manuele methode):</b><br><span class="code" id="c"></span><button id="cp">Kopieer code</button>';
+      document.getElementById('c').textContent=j.code;
+      document.getElementById('cp').onclick=async()=>{try{await navigator.clipboard.writeText(j.code);document.getElementById('cp').textContent='Gekopieerd ✓';}catch(e){alert(j.code);}};
+    }else{out.textContent='Mislukt: '+(j.message||JSON.stringify(j));}
+  }catch(e){clearInterval(timer);out.textContent='Fout: '+e;}
+  go.disabled=false;
+};
+</script></body></html>"""
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    if not _debug_allowed(request):
+        return PlainTextResponse("Niet beschikbaar (zet env-var DEBUG_TOKEN en gebruik ?token=...)", status_code=404)
+    url = DEFAULT_OAUTH_URL.replace("&", "&amp;").replace('"', "&quot;")
+    return HTMLResponse(LOGIN_PAGE.replace("__URL__", url))
+
 
 # ---- einde van main.py (deze regel moet als laatste staan) ----
