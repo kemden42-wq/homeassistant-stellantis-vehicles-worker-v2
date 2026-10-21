@@ -517,12 +517,9 @@ async def dump_debug(page, process_id, reason, email=None):
 # Main endpoint
 # --------------------------------------------------------------------------- #
 
-@app.post("/")
-async def fetch(request: Request):
+async def _login(payload, process_id):
+    """Volledige browser-login. Geeft (status, code_of_melding) terug."""
     global force_debug
-
-    process_id = uuid.uuid4().hex[:8]
-    log_start_process(process_id)
     context = None
     page = None
     state = {"code": None}
@@ -539,7 +536,6 @@ async def fetch(request: Request):
             log_process(f"Ignored intermediate code URL ({source}): {redact(url)[:120]}", process_id)
 
     try:
-        payload = await request.json()
         url = payload.get("url")
         email = payload.get("email")
         password = payload.get("password")
@@ -548,7 +544,7 @@ async def fetch(request: Request):
         force_debug = bool(payload.get("debug", False))
 
         if not url or not email or not password:
-            return http_response("Missing required params", process_id)
+            return (400, "Missing required params")
 
         async with browser_lock:
             await ensure_browser()
@@ -757,8 +753,8 @@ async def fetch(request: Request):
             context = None
 
             if code:
-                return http_response(code, process_id, 200)
-            return http_response("Code not found (zie DEBUG-regels in de log)", process_id)
+                return (200, code)
+            return (400, "Code not found (zie DEBUG-regels in de log)")
 
     except Exception as e:
         log_process(f"Error: {redact(str(e), email)}", process_id, True)
@@ -768,8 +764,91 @@ async def fetch(request: Request):
             except Exception:
                 pass
         if state["code"]:
-            return http_response(state["code"], process_id, 200)
-        return http_response(redact(str(e), email)[:500], process_id)
+            return (200, state["code"])
+        return (400, redact(str(e), email)[:500])
+
+
+# --------------------------------------------------------------------------- #
+# Wachtrij + code-cache
+#
+# Home Assistant (of de proxy ervoor) kapt de verbinding soms na ~60 s af, terwijl
+# de login op Render Free langer duurt. Daarom:
+#   - de login draait als losse taak en wordt afgemaakt, ook als HA al weg is;
+#   - een tweede klik op "Verzenden" sluit aan bij de lopende login (geen nieuwe login);
+#   - een verkregen code blijft CODE_TTL seconden bewaard en wordt direct teruggegeven.
+# --------------------------------------------------------------------------- #
+
+CODE_TTL = int(os.environ.get("CODE_TTL", "100"))
+login_jobs = {}    # key -> asyncio.Task
+code_cache = {}    # key -> (code, timestamp)
+
+
+def _job_key(payload):
+    import hashlib
+    raw = f"{payload.get('url', '')}|{payload.get('email', '')}|{payload.get('password', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cached_code(key):
+    item = code_cache.get(key)
+    if not item:
+        return None
+    code, ts = item
+    if time.monotonic() - ts > CODE_TTL:
+        code_cache.pop(key, None)
+        return None
+    return code
+
+
+async def _run_job(key, payload, process_id):
+    try:
+        status, message = await _login(payload, process_id)
+    except Exception as e:
+        status, message = 400, str(e)
+    if status == 200:
+        code_cache[key] = (message, time.monotonic())
+    return status, message
+
+
+@app.post("/")
+async def fetch(request: Request):
+    process_id = uuid.uuid4().hex[:8]
+    log_start_process(process_id)
+    try:
+        payload = await request.json()
+    except Exception:
+        return http_response("Invalid JSON", process_id)
+
+    if not payload.get("url") or not payload.get("email") or not payload.get("password"):
+        return http_response("Missing required params", process_id)
+
+    key = _job_key(payload)
+
+    code = _cached_code(key)
+    if code:
+        code_cache.pop(key, None)
+        log_process("Returning cached OAuth code (eerdere login was al klaar)", process_id, True)
+        return http_response(code, process_id, 200)
+
+    job = login_jobs.get(key)
+    if job and not job.done():
+        log_process("Login for this account already running, joining it", process_id, True)
+    else:
+        job = asyncio.create_task(_run_job(key, payload, process_id))
+        login_jobs[key] = job
+
+    try:
+        # shield: als HA de verbinding verbreekt, loopt de login gewoon door
+        status, message = await asyncio.shield(job)
+    except asyncio.CancelledError:
+        log_process("Client disconnected; login continues in background", process_id, True)
+        raise
+
+    if status == 200:
+        # Code is (waarschijnlijk) afgeleverd; houd hem toch kort vast voor het geval
+        # de verbinding met HA al verbroken was. Een volgende klik krijgt hem dan direct.
+        return http_response(message, process_id, 200)
+    return http_response(message, process_id, status)
 
 
 # --------------------------------------------------------------------------- #
