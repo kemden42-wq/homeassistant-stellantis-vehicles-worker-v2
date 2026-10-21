@@ -25,7 +25,7 @@ import re
 import time
 import uuid
 import asyncio
-from urllib.parse import urlsplit, parse_qs
+from urllib.parse import urlsplit, parse_qs, urljoin
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse, Response, PlainTextResponse
@@ -379,19 +379,21 @@ def http_response(message, process_id, status=400):
 # Helpers
 # --------------------------------------------------------------------------- #
 
+FINAL_REDIRECT_RE = re.compile(r"^([a-z][a-z0-9+.\-]*)://oauth2redirect(?:[/?#]|$)", re.I)
+
+
 def extract_final_code(url):
-    """Alleen <scheme>://oauth2redirect/...?code=... telt. Nooit http(s)."""
+    """Alleen de echte app-redirect telt: <eigen-scheme>://oauth2redirect/...?code=...
+    Nooit http(s), nooit een relatieve URL, nooit een URL waar oauth2redirect
+    alleen ergens in een parameter staat (dat zijn tussentijdse Gigya/AM-tokens)."""
     if not url:
         return None
-    low = url.lower()
-    if low.startswith("http://") or low.startswith("https://"):
+    m = FINAL_REDIRECT_RE.match(url.strip())
+    if not m or m.group(1).lower() in ("http", "https"):
         return None
-    if "oauth2redirect" not in low:
-        return None
-    # Code ONGEWIJZIGD teruggeven (nog percent-encoded), net als de originele worker;
-    # de integratie zet hem zo in de query string van de token-aanvraag.
-    m = re.search(r"[?&#]code=([^&#\s]+)", url)
-    return m.group(1) if m else None
+    # Code ONGEWIJZIGD teruggeven (nog percent-encoded), zoals de integratie verwacht.
+    c = re.search(r"[?&#]code=([^&#\s]+)", url)
+    return c.group(1) if c else None
 
 
 async def first_visible(page, selectors):
@@ -629,6 +631,8 @@ async def _open_login_page(url, state, timeout_page, process_id):
         try:
             if 300 <= resp.status < 400:
                 loc = resp.headers.get("location", "")
+                if loc and "://" not in loc.split("?", 1)[0]:
+                    loc = urljoin(resp.url, loc)
                 if loc:
                     log_process(f"REDIRECT {resp.status} {_short(resp.url)} -> {_short(loc)}", state.get("pid", "-"), True)
                     _on_url(state, loc, "redirect-header")
