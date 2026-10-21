@@ -345,13 +345,10 @@ def extract_final_code(url):
         return None
     if "oauth2redirect" not in low:
         return None
-    try:
-        query = urlsplit(url).query or (url.split("?", 1)[1] if "?" in url else "")
-        code = parse_qs(query).get("code", [None])[0]
-        return code or None
-    except Exception:
-        m = re.search(r"[?&]code=([^&#]+)", url)
-        return m.group(1) if m else None
+    # Code ONGEWIJZIGD teruggeven (nog percent-encoded), net als de originele worker;
+    # de integratie zet hem zo in de query string van de token-aanvraag.
+    m = re.search(r"[?&#]code=([^&#\s]+)", url)
+    return m.group(1) if m else None
 
 
 async def first_visible(page, selectors):
@@ -427,23 +424,36 @@ async def visible_text(page, selectors):
     return None
 
 
+SET_VALUE_JS = """
+(e, v) => {
+  const proto = Object.getPrototypeOf(e);
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+  setter.call(e, v);
+  e.dispatchEvent(new Event('input', {bubbles: true}));
+  e.dispatchEvent(new Event('change', {bubbles: true}));
+  e.dispatchEvent(new Event('blur', {bubbles: true}));
+}
+"""
+
+
 async def safe_fill(el, value):
+    """Snel invullen zonder klik (geen hit-test, geen wachttijd door overlays)."""
+    await el.evaluate("e => { e.scrollIntoView({block: 'center'}); e.focus(); e.value = ''; }")
     try:
-        await el.click(timeout=3000)
-    except Exception:
-        # veld wordt afgedekt (cookie-banner/overlay): focus via JS, geen klik nodig
-        await el.evaluate("e => { e.scrollIntoView({block: 'center'}); e.focus(); }")
-    await el.fill("", timeout=10000)
-    try:
-        await el.press_sequentially(value, delay=40)
-    except AttributeError:
-        await el.type(value, delay=40)
-    # Gigya valideert op input/change/blur
-    try:
-        await el.dispatch_event("change")
-        await el.dispatch_event("blur")
+        await el.press_sequentially(value, delay=10, timeout=4000)
     except Exception:
         pass
+    try:
+        current = await el.input_value(timeout=2000)
+    except Exception:
+        current = ""
+    if current != value:
+        await el.evaluate(SET_VALUE_JS, value)
+    else:
+        try:
+            await el.evaluate("e => { e.dispatchEvent(new Event('change', {bubbles: true})); e.dispatchEvent(new Event('blur', {bubbles: true})); }")
+        except Exception:
+            pass
 
 
 async def dump_debug(page, process_id, reason, email=None):
@@ -548,13 +558,40 @@ async def fetch(request: Request):
             context.on("request", lambda r: on_url(r.url, "request"))
             context.on("requestfailed", lambda r: on_url(r.url, "requestfailed"))
 
+            def on_response(resp):
+                try:
+                    if 300 <= resp.status < 400:
+                        loc = resp.headers.get("location", "")
+                        if loc:
+                            on_url(loc, "redirect-header")
+                except Exception:
+                    pass
+
+            context.on("response", on_response)
+
             page = await context.new_page()
+
+            # Zware/overbodige bestanden blokkeren via Chrome zelf (geen onderschepping,
+            # zodat de mymap://-redirect zichtbaar blijft). Scheelt veel tijd op Render Free.
+            try:
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.enable")
+                await cdp.send("Network.setBlockedURLs", {"urls": [
+                    "*.png*", "*.jpg*", "*.jpeg*", "*.gif*", "*.webp*", "*.svg*", "*.ico*",
+                    "*.woff*", "*.ttf*", "*.otf*", "*.mp4*", "*.webm*",
+                    "*google-analytics*", "*googletagmanager*", "*doubleclick*", "*facebook*",
+                    "*hotjar*", "*clarity.ms*", "*contentsquare*", "*adobedtm*", "*demdex*",
+                    "*omtrdc*", "*criteo*", "*tiktok*", "*linkedin*", "*bat.bing*",
+                ]})
+            except Exception as e:
+                log_process(f"Resource blocking unavailable: {e}", process_id)
+
             page.on("framenavigated", lambda f: on_url(f.url, "navigated"))
 
             log_process(f"Navigating to login: {redact(url)}", process_id, True)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_page)
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
+                await page.wait_for_load_state("load", timeout=8000)
             except Exception:
                 pass
 
@@ -564,7 +601,7 @@ async def fetch(request: Request):
             # Eerst het zichtbare wachtwoordveld; het e-mailveld moet in HETZELFDE formulier zitten
             # (Peugeot heeft meerdere formulieren met input[name="username"] op de pagina).
             log_process("Waiting for login form...", process_id, True)
-            pw_el = await wait_visible(page, PASSWORD_SELECTORS, timeout_input, process_id, "Password field", "password")
+            pw_el = await wait_visible(page, PASSWORD_SELECTORS, timeout_input, process_id, "Password field", "password", js_first=True)
 
             if pw_el:
                 email_el = await wait_visible(page, EMAIL_SELECTORS, 10000, process_id, "Email field", "email", js_first=True)
@@ -640,7 +677,7 @@ async def fetch(request: Request):
             otp_reported = False
 
             while not state["code"] and time.monotonic() < deadline:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
                 if state["code"]:
                     break
 
@@ -656,7 +693,7 @@ async def fetch(request: Request):
                     raise Exception(f"Login geweigerd door Peugeot: {redact(err, email)[:200]}")
 
                 # Consent-pagina
-                if time.monotonic() - last_consent_try > 4:
+                if time.monotonic() - last_consent_try > 2.5:
                     btn, csel, _ = await first_visible(page, CONSENT_SELECTORS)
                     on_consent_url = "authorize-consent" in current or "consent" in current.lower()
                     if btn or on_consent_url:
