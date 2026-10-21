@@ -477,25 +477,38 @@ SET_VALUE_JS = """
 
 
 async def safe_fill(el, value):
-    """Invullen zoals een gebruiker: klik + Playwright fill (zet waarde + input-event).
-    force=True slaat de wachttijd voor overlays over. Daarna controle, met fallbacks."""
+    """Snel en echt invullen: focus via JS, daarna één keer tekst invoegen via Chrome
+    (zelfde echte input-events als plakken). Fallback: Playwright fill / typen / JS."""
+    page = el.page
+    t0 = time.perf_counter()
     try:
-        await el.fill(value, force=True, timeout=5000)
+        await el.evaluate("e => { e.scrollIntoView({block: 'center'}); e.focus(); e.select && e.select(); }")
+        await page.keyboard.insert_text(value)
     except Exception:
+        pass
+    ok = await _value_of(el) == value
+    if not ok:
         try:
-            await el.evaluate("e => { e.scrollIntoView({block: 'center'}); e.focus(); }")
             await el.fill(value, force=True, timeout=5000)
         except Exception:
             pass
-    if await _value_of(el) != value:
+        ok = await _value_of(el) == value
+    if not ok:
         try:
             await el.evaluate("e => { e.focus(); e.value = ''; }")
             await el.press_sequentially(value, delay=20, timeout=8000)
         except Exception:
             pass
-    if await _value_of(el) != value:
+        ok = await _value_of(el) == value
+    if not ok:
         await el.evaluate(SET_VALUE_JS, value)
-    return await _value_of(el) == value
+        ok = await _value_of(el) == value
+    try:
+        await el.evaluate("e => { e.dispatchEvent(new Event('change', {bubbles: true})); }")
+    except Exception:
+        pass
+    print(f"[fill] {time.perf_counter() - t0:.1f}s ok={ok}", flush=True)
+    return ok
 
 
 async def _value_of(el):
