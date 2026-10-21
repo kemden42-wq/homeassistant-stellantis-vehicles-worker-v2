@@ -12,7 +12,7 @@ process_start = None
 browser_start = None
 context_start = None
 
-force_debug = False
+force_debug = True
 ok_count = 0
 ko_count = 0
 
